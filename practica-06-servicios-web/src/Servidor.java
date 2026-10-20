@@ -5,22 +5,50 @@ import java.io.OutputStream;
 import java.net.InetSocketAddress;
 import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
 import java.util.HashMap;
 import java.util.Map;
-import java.util.Set;
+import java.util.UUID;
+import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.Semaphore;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
 public class Servidor {
+    private static final String TOKEN_DEFECTO = "boleteria-2026";
+    private static final String TOKEN = System.getProperty("token", TOKEN_DEFECTO);
+    private static final long LEASE_MS = Long.getLong("lease", 15L) * 1000;
+    private static final int HILOS = Integer.getInteger("hilos", 16);
+    private static final int COLA = Integer.getInteger("cola", 64);
+    private static final int RELOJ_MAX = 1_000_000_000;
+    private static final int NOMBRE_MAX = 40;
+    private static final int RESPUESTAS_MAX = 100;
+
+    private static class Sesion {
+        final int idCliente;
+        final String nombre;
+        volatile long ultimaActividad = System.currentTimeMillis();
+        final Map<String, String> respuestas = new ConcurrentHashMap<>();
+
+        Sesion(int idCliente, String nombre) {
+            this.idCliente = idCliente;
+            this.nombre = nombre;
+        }
+
+        void tocar() { ultimaActividad = System.currentTimeMillis(); }
+    }
+
     private final String idNodo;
     private final String evento;
     private int disponibles;
     private int reloj;
     private final Semaphore cupos;
     private final AtomicInteger contadorClientes = new AtomicInteger(0);
-    private final Set<Integer> clientesConCupo = ConcurrentHashMap.newKeySet();
+    private final Map<String, Sesion> sesiones = new ConcurrentHashMap<>();
 
     public Servidor(String idNodo, String evento, int disponibles, int maxClientes) {
         this.idNodo = idNodo;
@@ -63,8 +91,6 @@ public class Servidor {
     }
 
     public synchronized int getDisponibles() { return disponibles; }
-    public String getEvento() { return evento; }
-    public String getIdNodo() { return idNodo; }
 
     public boolean intentarOcuparCupo() { return cupos.tryAcquire(); }
     public void liberarCupo() { cupos.release(); }
@@ -90,18 +116,44 @@ public class Servidor {
         try (OutputStream os = ex.getResponseBody()) { os.write(cuerpo); }
     }
 
+    private static boolean autenticado(HttpExchange ex) {
+        String recibido = ex.getRequestHeaders().getFirst("Authorization");
+        if (recibido == null) { return false; }
+        String esperado = "Bearer " + TOKEN;
+        return MessageDigest.isEqual(recibido.getBytes(StandardCharsets.UTF_8), esperado.getBytes(StandardCharsets.UTF_8));
+    }
+
+    private static String limpiar(String texto) {
+        if (texto == null) { return ""; }
+        String limpio = texto.replaceAll("\\p{Cntrl}", "").trim();
+        return limpio.length() > NOMBRE_MAX ? limpio.substring(0, NOMBRE_MAX) : limpio;
+    }
+
+    private static int leerReloj(String texto) {
+        int valor = Integer.parseInt(texto);
+        if (valor < 0 || valor > RELOJ_MAX) {
+            throw new NumberFormatException("reloj fuera de rango");
+        }
+        return valor;
+    }
+
     private interface Accion { void ejecutar(HttpExchange ex, Map<String, String> p) throws IOException; }
 
     private static void ruta(HttpServer http, String camino, String metodo, Accion accion) {
         http.createContext(camino, ex -> {
             try {
+                if (!autenticado(ex)) {
+                    ex.getResponseHeaders().set("WWW-Authenticate", "Bearer");
+                    responder(ex, 401, "{\"error\":\"Token ausente o invalido\"}");
+                    return;
+                }
                 if (!ex.getRequestMethod().equalsIgnoreCase(metodo)) {
                     responder(ex, 405, "{\"error\":\"Use el metodo " + metodo + "\"}");
                     return;
                 }
                 accion.ejecutar(ex, parametros(ex));
             } catch (NumberFormatException e) {
-                responder(ex, 400, "{\"error\":\"Parametro numerico invalido\"}");
+                responder(ex, 400, "{\"error\":\"Parametro numerico invalido o fuera de rango\"}");
             } finally {
                 ex.close();
             }
@@ -109,8 +161,8 @@ public class Servidor {
     }
 
     private void conectar(HttpExchange ex, Map<String, String> p) throws IOException {
-        String nombre = p.get("nombre");
-        if (nombre == null || nombre.isBlank()) {
+        String nombre = limpiar(p.get("nombre"));
+        if (nombre.isEmpty()) {
             responder(ex, 400, "{\"error\":\"Falta el parametro nombre\"}");
             return;
         }
@@ -125,43 +177,83 @@ public class Servidor {
             return;
         }
 
-        clientesConCupo.add(idCliente);
+        String idSesion = UUID.randomUUID().toString();
+        sesiones.put(idSesion, new Sesion(idCliente, nombre));
         System.out.println("[" + idNodo + "][cliente #" + idCliente + "] Atendiendo a " + nombre);
-        responder(ex, 200, "{\"estado\":\"ok\",\"idCliente\":" + idCliente + ",\"reloj\":" + r + "}");
+        responder(ex, 200, "{\"estado\":\"ok\",\"idCliente\":" + idCliente + ",\"sesion\":\"" + idSesion + "\",\"reloj\":" + r + "}");
     }
 
     private void vender(HttpExchange ex, Map<String, String> p) throws IOException {
-        String nombre = p.getOrDefault("nombre", "");
-        int idCliente = Integer.parseInt(p.get("idCliente"));
-        int relojV = Integer.parseInt(p.get("reloj"));
-
-        if (!clientesConCupo.contains(idCliente)) {
-            responder(ex, 403, "{\"error\":\"El cliente no tiene un lugar en esta taquilla. Use /conectar primero\"}");
+        String idSesion = ex.getRequestHeaders().getFirst("X-Sesion");
+        Sesion s = idSesion == null ? null : sesiones.get(idSesion);
+        if (s == null) {
+            responder(ex, 403, "{\"error\":\"Sesion invalida o vencida. Use /conectar\"}");
             return;
         }
 
-        boolean vendido = vender(nombre, idCliente, relojV);
-        int relojR = getReloj();
-        int restantes = getDisponibles();
-        responder(ex, 200, "{\"estado\":\"" + (vendido ? "ok" : "agotado") + "\",\"disponibles\":" + restantes + ",\"reloj\":" + relojR + "}");
+        String idPeticion = p.get("idPeticion");
+        if (idPeticion == null || idPeticion.isBlank() || idPeticion.length() > 64) {
+            responder(ex, 400, "{\"error\":\"Falta idPeticion (maximo 64 caracteres)\"}");
+            return;
+        }
+        int relojV = leerReloj(p.get("reloj"));
+
+        synchronized (s) {
+            if (!sesiones.containsKey(idSesion)) {
+                responder(ex, 403, "{\"error\":\"Sesion invalida o vencida. Use /conectar\"}");
+                return;
+            }
+            s.tocar();
+
+            String previa = s.respuestas.get(idPeticion);
+            if (previa != null) {
+                int r = actualizarConMensaje(relojV);
+                System.out.println("[" + idNodo + "][reloj " + r + "][cliente #" + s.idCliente + " " + s.nombre + "] Petición repetida " + idPeticion.substring(0, Math.min(8, idPeticion.length())) + ": se devuelve la respuesta guardada, sin vender otro boleto.");
+                responder(ex, 200, previa.substring(0, previa.length() - 1) + ",\"repetida\":true}");
+                return;
+            }
+            if (s.respuestas.size() >= RESPUESTAS_MAX) {
+                responder(ex, 429, "{\"error\":\"Demasiadas peticiones en esta sesion\"}");
+                return;
+            }
+
+            boolean vendido = vender(s.nombre, s.idCliente, relojV);
+            String json = "{\"estado\":\"" + (vendido ? "ok" : "agotado") + "\",\"disponibles\":" + getDisponibles() + ",\"reloj\":" + getReloj() + "}";
+            s.respuestas.put(idPeticion, json);
+            s.tocar();
+            responder(ex, 200, json);
+        }
     }
 
     private void salir(HttpExchange ex, Map<String, String> p) throws IOException {
-        String nombre = p.getOrDefault("nombre", "");
-        int idCliente = Integer.parseInt(p.get("idCliente"));
-        int relojV = Integer.parseInt(p.get("reloj"));
+        String idSesion = ex.getRequestHeaders().getFirst("X-Sesion");
+        Sesion s = idSesion == null ? null : sesiones.remove(idSesion);
+        int relojV = leerReloj(p.get("reloj"));
 
         int r = actualizarConMensaje(relojV);
-        System.out.println("[" + idNodo + "][reloj " + r + "][cliente #" + idCliente + " " + nombre + "] Terminó su turno.");
-
-        if (clientesConCupo.remove(idCliente)) {
+        if (s != null) {
+            System.out.println("[" + idNodo + "][reloj " + r + "][cliente #" + s.idCliente + " " + s.nombre + "] Terminó su turno.");
             liberarCupo();
+        } else {
+            System.out.println("[" + idNodo + "][reloj " + r + "] Salida repetida o sesión vencida: no hay cupo que liberar.");
         }
         responder(ex, 200, "{\"estado\":\"ok\",\"reloj\":" + r + "}");
     }
 
     private void estado(HttpExchange ex, Map<String, String> p) throws IOException {
-        responder(ex, 200, "{\"idNodo\":\"" + idNodo + "\",\"evento\":\"" + evento + "\",\"disponibles\":" + getDisponibles() + ",\"reloj\":" + getReloj() + "}");
+        responder(ex, 200, "{\"idNodo\":\"" + idNodo + "\",\"evento\":\"" + evento + "\",\"disponibles\":" + getDisponibles() + ",\"sesiones\":" + sesiones.size() + ",\"reloj\":" + getReloj() + "}");
+    }
+
+    private void expirarSesiones() {
+        long ahora = System.currentTimeMillis();
+        for (Map.Entry<String, Sesion> e : sesiones.entrySet()) {
+            Sesion s = e.getValue();
+            if (ahora - s.ultimaActividad > LEASE_MS && sesiones.remove(e.getKey(), s)) {
+                liberarCupo();
+                int r = eventoLocal();
+                System.out.println("[" + idNodo + "][reloj " + r + "][cliente #" + s.idCliente + " " + s.nombre + "] Lease vencido: se libera su lugar por inactividad.");
+            }
+        }
     }
 
     public static void main(String[] args) throws IOException {
@@ -173,8 +265,24 @@ public class Servidor {
 
         Servidor servidor = new Servidor(idNodo, evento, boletos, maxClientes);
 
+        ThreadPoolExecutor pool = new ThreadPoolExecutor(HILOS, HILOS, 0L, TimeUnit.SECONDS,
+                new ArrayBlockingQueue<>(COLA), new ThreadPoolExecutor.AbortPolicy());
+
+        ScheduledExecutorService limpiador = Executors.newSingleThreadScheduledExecutor(r -> {
+            Thread t = new Thread(r, "limpiador-de-sesiones");
+            t.setDaemon(true);
+            return t;
+        });
+        limpiador.scheduleAtFixedRate(() -> {
+            try {
+                servidor.expirarSesiones();
+            } catch (Throwable t) {
+                System.out.println("[" + idNodo + "] Error en el limpiador: " + t);
+            }
+        }, 1, 1, TimeUnit.SECONDS);
+
         HttpServer http = HttpServer.create(new InetSocketAddress(puerto), 0);
-        http.setExecutor(Executors.newCachedThreadPool());
+        http.setExecutor(pool);
         ruta(http, "/conectar", "POST", servidor::conectar);
         ruta(http, "/vender", "POST", servidor::vender);
         ruta(http, "/salir", "POST", servidor::salir);
@@ -186,6 +294,8 @@ public class Servidor {
         System.out.println("[" + idNodo + "] Evento: '" + evento + "'");
         System.out.println("[" + idNodo + "] Boletos disponibles: " + boletos);
         System.out.println("[" + idNodo + "] Vendedores simultáneos permitidos: " + maxClientes);
+        System.out.println("[" + idNodo + "] Hilos: " + HILOS + ", cola: " + COLA + ", lease: " + (LEASE_MS / 1000) + " s");
+        System.out.println("[" + idNodo + "] Autenticación: Bearer token" + (TOKEN.equals(TOKEN_DEFECTO) ? " (token por defecto: cámbielo con -Dtoken=...)" : ""));
         System.out.println("[" + idNodo + "] Esperando vendedores...\n");
     }
 }
