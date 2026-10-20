@@ -1,0 +1,20 @@
+# Compilados
+out/
+*.class
+
+# Logs
+*.log
+
+# Editores / IDEs
+.idea/
+.vscode/
+nbproject/private/
+nbproject/
+nbbuild/
+nbdist/
+target/
+*.iml
+
+# Sistema
+.DS_Store
+Thumbs.db
