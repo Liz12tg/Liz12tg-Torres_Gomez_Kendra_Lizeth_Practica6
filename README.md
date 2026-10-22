@@ -57,7 +57,6 @@ Por eso el token nunca llega al navegador. `Interfaz` además:
 java -cp out Interfaz 8080 localhost:5000 localhost:5001 localhost:5002
 ```
 
-Argumentos: `puerto sistema(host:puerto) caja1 caja2 ...`. Debe ejecutarse desde la carpeta `practica-06-servicios-web` (lee `web/index.html`).
 
 | Método | Ruta | Para qué |
 |--------|------|----------|
