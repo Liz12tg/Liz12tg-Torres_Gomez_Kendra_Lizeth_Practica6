@@ -134,11 +134,3 @@ curl.exe -X POST -H "Authorization: Bearer boleteria-2026" -H "X-Sesion: <sesion
 Repetir `/vender` con el mismo `idPeticion` devuelve la misma respuesta con `"repetida":true` y no vende otro boleto.
 Si los acentos salen raros en la consola de Windows: `chcp 65001`.
 
-## Limitaciones conocidas
-
-- No hay apartado temporal de boletos (como en Ticketmaster, donde el asiento se reserva unos minutos antes de pagar): aquí cada boleto se vende al instante.
-- El inventario vive en memoria en `Sistema`: si se reinicia, vuelve a tener todos los boletos. Además es un único punto de falla.
-- Sin HTTPS: el token viaja en texto plano (suficiente en `localhost`).
-- El token por defecto está en el código; en un despliegue real vendría de una variable de entorno.
-- La fila de espera vive en el cliente (reintenta cada segundo), no en un servidor: no garantiza orden de llegada.
-- Si se pierde la respuesta de `/conectar`, el cupo queda ocupado hasta que vence el lease.
